@@ -1,121 +1,110 @@
 # -*- coding: utf-8 -*-
-import urllib, urllib2
+import settings
+import re
+from helper import log
+from helper import confirm
+from requests import get
+from requests import post
+from colorama import Fore
 
-_LOGIN_COOKIE = ''
+def score(session):
+    if not session:
+        raise Exception('Invalid session for the request.')
 
-def HttpRequest(url, params = ''):
-        if params != '':
-                params = urllib.urlencode(params)
-                req = urllib2.Request(url, params)
-        else:
-                req = urllib2.Request(url)
+    data = getScorePageData(session)
 
-        # 添加Header 或者 Cookies
-        global _LOGIN_COOKIE
-        req.add_header('Cookie', _LOGIN_COOKIE)
+    if checkDone(data):
+        if confirm('It seem you have been finished the marking operation. Do you want to continue anyway?', nevigate = True):
+            raise Exception('User has cancelled manually.')
 
-        res = urllib2.urlopen(req)
-        result = res.read()
-        return result
+    term = currentTerm(data)
+    if not term:
+        raise Exception('Cannot found the term from the response data.')
 
-def setScore(teacherId):
-        params = {
-                'DdXq':'2014/2015(2)',
-                'BCpKc':teacherId,
-                'DF44':'8',
-                'BZ':'100.0',
-                'DF46':'8',
-                'DF47':'8',
-                'DF72':'6',
-                'DF43':'5',
-                'DF55':'5',
-                'DF60':'5',
-                'DF59':'7',
-                'DF61':'10',
-                'DF74':'8',
-                'DF179':'6',
-                'DF180':'6',
-                'DF45':'6',
-                'DF56':'6',
-                'DF73':'6',
-                'DF178':'0',
-                'DF181':'0',
-                'DF182':'0',
-                'SaveD':'1',
-                'cDdXq':'2014/2015(2)',
-                'cBKcCode':teacherId,
-                'cBKcText':'<未评>',
-                'PjXx':'亲爱的同学，你对老师的真实评价可以促进老师提高教学质量，也使母校能够了解每位教师的教学情况，所以，请实事求是地给每位老师做出评价，如果有老师变相拉分可在扣分项（有悖师德的言行）打负分，谢谢你！',
-                'pageId':'301601',
-                'Xh':'141804004',
-                'actionId':'register'}
-        result = HttpRequest('http://jwxt.jmpt.cn:8125/JspHelloWorld/servlets/CommonServlet', params)
+    t = teachers(data)
+    if not t:
+        raise Exception('Empty teacher list, nothing found.')
 
-        return result
+    for teacher in t:
+        if teacher[settings.FIELD_TEAHCER_STATUS] == settings.RESULT_ALREADY_SCORE and settings.IGNORE_ALREADY_SCORED:
+            log(Fore.YELLOW + 'Ignore performing for teacher %s who has been marked.' % teacher[settings.FIELD_TEACHER_NAME])
+            continue
 
-def setScoreByList(teacherList):
-        if len(teacherList) > 0:
-                print 'Get start to marking...'
-                for teacher in teacherList:
-                        print 'Give a mark to ' + teacher + '...'
-                        setScore(teacher)
+        log('Perform the marking operation for teacher %s.' % teacher[settings.FIELD_TEACHER_NAME])
+        mark(teacher[settings.FIELD_TEACHER_ID], term, session)
 
-                print 'All done! Now you should log-in to the system and then confirm all of the score to the server.'
-        else:
-                'The list of teacher is empty!'
+def getScorePageData(session):
+    '''
+    Retrieve the whole html data of the score page
+    '''
+    r = post(settings.SERVER_URL_COMMON, data=settings.PAYLOAD_SCORE_INDEX_TEMPLATE, cookies=session)
+    return r.content
 
-def getTeacherList(data):
-        Ret = []
-        
-        # 教师ID列表起始关键字
-        firstKw = '<option value="0">-请选择-</option>'
-        # 每个教师ID前缀关键字
-        eachKw = '<option value='
-        # 结束关键字
-        endOfEachKw = ' >'
-        # 待清理关键词，防止遍历出错
-        killKw = ' selected'
+def checkDone(data):
+    return data.find(settings.RESULT_ALREADY_DONE_ALL) != -1
 
-        endOffset = 0
+def currentTerm(data):
+    '''
+    Extract the current term from the score page, such as 2015/2016(2), it's necessary for the score operation
+    '''
+    pattern = re.compile('<option.+?selected>')
+    raw_term = pattern.search(data)
+    if raw_term == None:
+        return False
 
-        firstKwLen = len(firstKw)
-        eachKwLen = len(eachKw)
-        endOfEachKwLen = len(endOfEachKw)
+    term = re.search('[0-9]{4}/[0-9]{4}\([0-9]+\)', raw_term.group(0))
+    if term == None:
+        return False
 
-        index = data.find(firstKw)
-        if index == -1:
-                return Ret
-        
-        data = data[index + firstKwLen:]
-        # 清理数据
-        data = data.replace(killKw, ' ');
+    term = term.group(0);
+    log(Fore.GREEN + "Retrieve current term: %s" % term)
 
-        index = data.find(eachKw)
-        while(index != -1):
-                index += eachKwLen
-                endOffset = data.find(endOfEachKw)
-                
-                print 'Found Teacher ID: ' + data[index:endOffset]
-                Ret.append(data[index:endOffset])
+    return term
 
-                endOffset += endOfEachKwLen
-                data = data[endOffset:]
+def teachers(data):
+    '''
+    Retrieve the teacher information
+    '''
+    # pattern = re.compile('<option[^(]+? >')
+    pattern = re.compile(r'<option[^()"]+?\s+>.+?</option>')
+    # <option value=id>xxx</option> list
+    raw_teachers = pattern.findall(data)
+    if len(raw_teachers) == 0:
+        return False
 
-                index = data.find(eachKw)
+    t = []
+    for raw_t in raw_teachers:
+        # Split to multi groups
+        pattern = re.compile(r'<.+?>')
+        parts = pattern.findall(raw_t)
+        if (len(parts) < 3):
+            continue
 
-        return Ret
+        teacherId = re.search(r'[^(<option value=)]+', parts[0]).group()
+        teacherName = re.search(r'[^<>]+', parts[1]).group()
+        status = re.search(r'[^<>]+', parts[2]).group()
 
-#---------------------- Main ----------------------
-print '============================================'
-print '             Auto-Score by Soxfmr             '
-print '              ver 0.1 20150630              '
-print '============================================'
+        log(Fore.GREEN + 'Found id %s for teacher %s with status %s.' % (teacherId, teacherName, status))
 
-_LOGIN_COOKIE = raw_input('登录 Cookies：')
+        t.append({settings.FIELD_TEACHER_ID : teacherId,
+                settings.FIELD_TEACHER_NAME : teacherName,
+                settings.FIELD_TEAHCER_STATUS : status})
 
-print 'Request data form website...'
-# 获取教师列表
-data = HttpRequest('http://jwxt.jmpt.cn:8125/JspHelloWorld/StdPjCz.jsp')
-teacherList = getTeacherList(data)
-# 开始评教
-setScoreByList(teacherList)
+    return t
+
+def mark(teacherId, term, session):
+    '''
+    Give a mark to the teacher
+    '''
+    payload = settings.PAYLOAD_SCORE_TEMPLATE.copy()
+
+    for field in settings.FIELDS_FOR_TEACHER:
+        payload[field] = teacherId
+
+    for field in settings.FIELDS_FOR_TERM:
+        payload[field] = term
+
+    payload[settings.FIELD_STUDENT] = session[settings.FIELD_USERNAME]
+
+    r = post(settings.SERVER_URL_COMMON, data=payload, cookies=session)
+    return r.text
